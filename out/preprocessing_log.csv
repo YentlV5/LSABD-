@@ -1,0 +1,7 @@
+stap,n_variabelen,n_personen
+start,486,11933
+alleen onderzochte personen,486,8860
+"constante, ID/gewicht en vlag-variabelen weg",331,8860
+variabelen met > 40% NA weg,203,8860
+numerieke kenmerken na filtering (b),133,8860
+personen met > 50% NA in kenmerken weg,133,7226
