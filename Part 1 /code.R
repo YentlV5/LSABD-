@@ -7,7 +7,7 @@
 
 # ---- 0. Voorbereiding ----------------------------------------
 library(tidyverse)
-setwd("~/Documents/GitHub/Project-LSABD")
+setwd("~/Documents/GitHub/LSABD-")
 dir.create("out", showWarnings = FALSE)
 
 # ---- 1. Data inlezen -----------------------------------------
@@ -613,3 +613,181 @@ for (v in c("age_group", "sex", "period")) {
            theme_minimal(base_size = 13),
          width = 6, height = 5, bg = "white")
 }
+
+---------------------------------------------------------------
+# Part 2: BMI en log-hs-CRP, gecorrigeerd voor leeftijd en cotinine, met interactie BMI x geslacht
+# Werkmap: zet die via een RStudio-project of setwd() op de projectmap (met de submap data/)
+---------------------------------------------------------------
+  
+library(tidyverse)
+dir.create("out", showWarnings = FALSE)
+
+col_sex <- c(man = "#0072B2", vrouw = "#D55E00")   # zelfde kleuren als in Part 1
+
+# ---------------------------------------------------------------
+# 4.1 Selectie van personen
+# ---------------------------------------------------------------
+dat <- read_csv("data/NHANES_merged.csv", guess_max = 20000)
+
+sel <- dat |>
+  select(SEQN, RIAGENDR, RIDAGEYR, BMXBMI, LBXHSCRP, LBXCOT, LBDCOTLC, WTPH2YR_HSCRP_L)
+
+stappen <- tibble(
+  stap = c("Alle personen",
+           "Volwassenen (>= 18 jaar)",
+           "BMI gemeten",
+           "hs-CRP gemeten",
+           "Cotinine gemeten"),
+  n = c(nrow(sel),
+        sum(sel$RIDAGEYR >= 18),
+        sum(sel$RIDAGEYR >= 18 & !is.na(sel$BMXBMI)),
+        sum(sel$RIDAGEYR >= 18 & !is.na(sel$BMXBMI) & !is.na(sel$LBXHSCRP)),
+        sum(sel$RIDAGEYR >= 18 & !is.na(sel$BMXBMI) & !is.na(sel$LBXHSCRP) & !is.na(sel$LBXCOT))))
+stappen
+write_csv(stappen, "out/part2_selectie.csv")
+
+d <- sel |>
+  filter(RIDAGEYR >= 18) |>
+  drop_na(BMXBMI, LBXHSCRP, LBXCOT, RIAGENDR) |>
+  mutate(sex     = factor(RIAGENDR, levels = c(1, 2), labels = c("man", "vrouw")),
+         age     = RIDAGEYR,
+         bmi     = BMXBMI,
+         log_crp = log(LBXHSCRP),          # natuurlijke log
+         log_cot = log10(LBXCOT))          # log10
+
+table(d$sex)
+sum(d$LBXHSCRP > 10)       # personen met CRP > 10 mg/L (mogelijk acute infectie)
+mean(d$LBDCOTLC == 1)      # aandeel cotinine onder detectiegrens
+
+# ---------------------------------------------------------------
+# 4.2 Beschrijvende tabel per geslacht
+# ---------------------------------------------------------------
+beschrijving <- d |>
+  group_by(sex) |>
+  summarise(n = n(),
+            leeftijd_mediaan = median(age),
+            bmi_mediaan = median(bmi),
+            bmi_Q1 = quantile(bmi, 0.25), bmi_Q3 = quantile(bmi, 0.75),
+            crp_mediaan = median(LBXHSCRP),
+            crp_Q1 = quantile(LBXHSCRP, 0.25), crp_Q3 = quantile(LBXHSCRP, 0.75),
+            cotinine_mediaan = median(LBXCOT),
+            obees_pct = 100 * mean(bmi >= 30))
+beschrijving
+write_csv(beschrijving, "out/part2_beschrijving.csv")
+
+# ---------------------------------------------------------------
+# 4.3 Verdelingen voor en na log-transformatie
+# ---------------------------------------------------------------
+lang <- bind_rows(
+  d |> transmute(waarde = LBXHSCRP, panel = "hs-CRP (mg/L)"),
+  d |> transmute(waarde = log_crp,  panel = "log hs-CRP"),
+  d |> transmute(waarde = LBXCOT,   panel = "cotinine (ng/mL)"),
+  d |> transmute(waarde = log_cot,  panel = "log10 cotinine")) |>
+  mutate(panel = factor(panel, levels = c("hs-CRP (mg/L)", "log hs-CRP",
+                                          "cotinine (ng/mL)", "log10 cotinine")))
+p_dist <- ggplot(lang, aes(waarde)) +
+  geom_histogram(bins = 40, fill = "grey60", colour = "white") +
+  facet_wrap(~ panel, scales = "free", ncol = 2) +
+  labs(x = NULL, y = "aantal personen") +
+  theme_minimal(base_size = 12)
+ggsave("out/fig4_verdelingen.png", p_dist, width = 8, height = 5, dpi = 150, bg = "white")
+
+# ---------------------------------------------------------------
+# 4.4 Het model
+# ---------------------------------------------------------------
+model <- lm(log_crp ~ bmi * sex + age + log_cot, data = d)
+summary(model)
+ci <- confint(model)
+tab <- tibble(term = names(coef(model)),
+              estimate = coef(model),
+              ci_laag = ci[, 1], ci_hoog = ci[, 2],
+              p = summary(model)$coefficients[, 4])
+tab
+write_csv(tab, "out/part2_model.csv")
+
+# test van de interactie met een F-test: model mét tegenover model zonder interactie
+model0 <- lm(log_crp ~ bmi + sex + age + log_cot, data = d)
+anova(model0, model)
+
+# ---------------------------------------------------------------
+# 4.5 BMI-helling per geslacht en procentueel effect
+# ---------------------------------------------------------------
+b <- coef(model); V <- vcov(model)
+helling_man   <- b["bmi"]
+se_man        <- sqrt(V["bmi", "bmi"])
+helling_vrouw <- b["bmi"] + b["bmi:sexvrouw"]
+se_vrouw      <- sqrt(V["bmi", "bmi"] + V["bmi:sexvrouw", "bmi:sexvrouw"] + 2 * V["bmi", "bmi:sexvrouw"])
+
+hellingen <- tibble(sex = c("man", "vrouw"),
+                    helling = c(helling_man, helling_vrouw),
+                    ci_laag = helling - 1.96 * c(se_man, se_vrouw),
+                    ci_hoog = helling + 1.96 * c(se_man, se_vrouw)) |>
+  mutate(pct_per_bmi_punt   = 100 * (exp(helling) - 1),
+         pct_per_5_bmi_punt = 100 * (exp(5 * helling) - 1))
+hellingen
+write_csv(hellingen, "out/part2_hellingen.csv")
+
+# ---------------------------------------------------------------
+# 4.6 Aannames controleren
+# ---------------------------------------------------------------
+png("out/fig4_diagnostiek.png", width = 1400, height = 1100, res = 150)
+par(mfrow = c(2, 2))
+plot(model, which = 1:4)
+dev.off()
+
+# lineariteit: voegt een kwadratische BMI-term iets toe?
+model_kwad <- lm(log_crp ~ bmi * sex + I(bmi^2) + age + log_cot, data = d)
+anova(model, model_kwad)
+
+# collineariteit tussen de verklarende variabelen
+cor(d |> select(bmi, age, log_cot))
+
+# constante spreiding: Breusch-Pagan test (alleen als lmtest/sandwich beschikbaar is)
+if (requireNamespace("lmtest", quietly = TRUE) && requireNamespace("sandwich", quietly = TRUE)) {
+  print(lmtest::bptest(model))
+  print(lmtest::coeftest(model, vcov = sandwich::vcovHC(model, type = "HC3")))
+}
+
+# ---------------------------------------------------------------
+# 4.7 Gevoeligheidsanalyses
+# ---------------------------------------------------------------
+haal <- function(m, naam) {
+  s <- summary(m)$coefficients["bmi:sexvrouw", ]
+  tibble(analyse = naam, n = nobs(m), interactie = s[1], se = s[2], p = s[4])
+}
+m_geen_acuut <- lm(log_crp ~ bmi * sex + age + log_cot, data = filter(d, LBXHSCRP <= 10))
+m_gewogen    <- lm(log_crp ~ bmi * sex + age + log_cot, data = d, weights = WTPH2YR_HSCRP_L)
+m_zonder_cot <- lm(log_crp ~ bmi * sex + age, data = d)
+
+m_kwad_geen_acuut <- lm(log_crp ~ bmi * sex + I(bmi^2) + age + log_cot, data = filter(d, LBXHSCRP <= 10))
+
+gevoeligheid <- bind_rows(
+  haal(model,             "Hoofdmodel (lineair)"),
+  haal(model_kwad,        "Met BMI^2-term"),
+  haal(m_geen_acuut,      "Zonder CRP > 10 mg/L"),
+  haal(m_kwad_geen_acuut, "Zonder CRP > 10 mg/L, met BMI^2"),
+  haal(m_gewogen,         "Gewogen (WTPH2YR_HSCRP_L)"),
+  haal(m_zonder_cot,      "Zonder cotinine"))
+gevoeligheid
+write_csv(gevoeligheid, "out/part2_gevoeligheid.csv")
+
+# ---------------------------------------------------------------
+# 4.8 Figuur: log-CRP tegen BMI, per geslacht
+# ---------------------------------------------------------------
+p_main <- ggplot(d, aes(bmi, log_crp, colour = sex, fill = sex)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", formula = y ~ x, linewidth = 1.2) +
+  scale_colour_manual(values = col_sex, name = NULL) +
+  scale_fill_manual(values = col_sex, name = NULL) +
+  labs(x = "BMI (kg/m2)", y = "log hs-CRP") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+ggsave("out/fig4_bmi_crp.png", p_main, width = 7, height = 5, dpi = 150, bg = "white")
+
+# hellingen met 95%-betrouwbaarheidsinterval
+p_slope <- ggplot(hellingen, aes(helling, sex, colour = sex)) +
+  geom_pointrange(aes(xmin = ci_laag, xmax = ci_hoog), size = 0.8) +
+  scale_colour_manual(values = col_sex, guide = "none") +
+  labs(x = "toename van log hs-CRP per BMI-punt (95% BI)", y = NULL) +
+  theme_minimal(base_size = 12)
+ggsave("out/fig4_hellingen.png", p_slope, width = 6, height = 2.6, dpi = 150, bg = "white")
